@@ -1,0 +1,920 @@
+﻿===== doom_plaincnn_sanity_check.ipynb
+--- 0 markdown
+# PlainCNN: Extracting the Trained Checkpoint for SNN Conversion
+
+Goal: rebuild the trained `conversion_friendly_v1` checkpoint as a plain PyTorch
+`nn.Module`, decoupled from Sample Factory's `VizdoomEncoder`/actor-critic classes, and
+verify it reproduces the known baseline reward (**0.757 ± 0.121** over 50 episodes).
+
+This is NOT the SNN yet -- it's the de-risking step before conversion, so that any
+problem later can be isolated to the SNN conversion itself, not the weight extraction.
+
+Confirmed from the checkpoint's `state_dict` (do this check again if you re-extract
+from a different checkpoint):
+```
+encoder.basic_encoder.enc.conv_head.0  -> Conv2d(3, 32, kernel=8, stride=4) + bias
+encoder.basic_encoder.enc.conv_head.2  -> Conv2d(32, 64, kernel=4, stride=2) + bias
+encoder.basic_encoder.enc.conv_head.4  -> Conv2d(64, 128, kernel=3, stride=2) + bias
+encoder.basic_encoder.enc.mlp_layers.0 -> Linear(2304, 512) + bias
+action_parameterization.distribution_linear -> Linear(512, 4) + bias   (KEEP -- policy head)
+critic_linear                               -> Linear(512, 1) + bias   (DISCARD -- training only)
+obs_normalizer.running_mean_std.running_mean_std.obs.{running_mean,running_var,count}
+                                             -> shape (3, 72, 128)     (KEEP -- input preprocessing)
+returns_normalizer.*                        -> (DISCARD -- training only, for the critic)
+```
+
+**Run this on Google Colab or Kaggle (Linux-backed) -- not native Windows.**
+--- 1 markdown
+### 1. Install (only needed for `create_env` / `ObservationNormalizer` / registration)
+We still depend on Sample Factory here -- not for the model, but to reuse its *exact*
+environment construction and observation-normalization code, so the sanity check isn't
+comparing against a hand-reimplemented (and possibly subtly wrong) version of either.
+--- 2 code
+!apt-get update -qq
+!apt-get install -y build-essential zlib1g-dev libsdl2-dev libjpeg-dev nasm tar \
+    libbz2-dev libgtk2.0-dev cmake git libfluidsynth-dev libgme-dev libopenal-dev \
+    timidity libwildmidi-dev unzip ffmpeg libboost-all-dev liblua5.1-dev xvfb
+!pip install sample-factory
+!pip install vizdoom
+--- 3 markdown
+### 2. GPU check + the PyTorch 2.6 `torch.load` fix
+Needed fresh in every new session -- this is runtime state, not saved anywhere.
+--- 4 code
+import torch
+
+print("CUDA available:", torch.cuda.is_available())
+
+_original_torch_load = torch.load
+
+
+def _patched_torch_load(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _original_torch_load(*args, **kwargs)
+
+
+torch.load = _patched_torch_load
+print("torch.load patched: weights_only will default to False for this session.")
+--- 5 markdown
+### 3. Get the checkpoint back (mount Drive, or re-upload the zip)
+--- 6 code
+import os
+from pathlib import Path
+
+# Locate checkpoint and config inside repository folder: conversion_friendly_v1
+EXPERIMENT_DIR = Path('conversion_friendly_v1')
+if not EXPERIMENT_DIR.exists():
+    EXPERIMENT_DIR = Path('.')
+
+checkpoint_path = EXPERIMENT_DIR / 'checkpoint_p0' / 'checkpoint_000000490_2007040.pth'
+config_path = EXPERIMENT_DIR / 'config.json'
+
+print(f'Loading checkpoint: {checkpoint_path}')
+checkpoint = torch.load(checkpoint_path, map_location='cpu')
+print('Checkpoint keys:', list(checkpoint.keys()))
+state_dict = checkpoint['model']
+--- 7 markdown
+### 4. Register Sample Factory's ViZDoom environment and rebuild the training config
+We only use this to construct the environment and the real `ObservationNormalizer` --
+not the model.
+--- 8 code
+import functools
+
+from sample_factory.cfg.arguments import parse_full_cfg, parse_sf_args
+from sample_factory.envs.env_utils import register_env
+from sample_factory.envs.create_env import create_env
+
+from sf_examples.vizdoom.doom.doom_params import add_doom_env_args, doom_override_defaults
+from sf_examples.vizdoom.doom.doom_utils import DOOM_ENVS, make_doom_env_from_spec
+
+
+def register_vizdoom_envs():
+    for env_spec in DOOM_ENVS:
+        make_env_func = functools.partial(make_doom_env_from_spec, env_spec)
+        register_env(env_spec.name, make_env_func)
+
+
+def parse_vizdoom_cfg(argv=None, evaluation=False):
+    parser, _ = parse_sf_args(argv=argv, evaluation=evaluation)
+    add_doom_env_args(parser)
+    doom_override_defaults(parser)
+    return parse_full_cfg(parser, argv)
+
+
+register_vizdoom_envs()
+
+env_name = "doom_basic"
+cfg = parse_vizdoom_cfg(
+    argv=[f"--env={env_name}", "--experiment=conversion_friendly_v1"],
+    evaluation=True,
+)
+
+env = create_env(env_name, cfg=cfg, env_config=None)
+print("Observation space:", env.observation_space)
+print("Action space:", env.action_space)
+--- 9 markdown
+### 5. Rebuild the real `ObservationNormalizer` and load its trained statistics
+Reusing Sample Factory's actual class (not a hand-reimplemented formula) -- this is the
+exact module confirmed earlier: scale by 1/255, then `(x - running_mean) /
+sqrt(running_var + eps)`, then clamp to [-5, 5].
+--- 10 code
+import gymnasium as gym
+from sample_factory.utils.normalize import ObservationNormalizer
+
+obs_space_dict = gym.spaces.Dict({"obs": env.observation_space})
+
+print("normalize_input:", cfg.normalize_input, "| obs_scale:", cfg.obs_scale)
+
+obs_normalizer = ObservationNormalizer(obs_space_dict, cfg)
+obs_normalizer.eval()
+
+normalizer_state = {
+    k[len("obs_normalizer."):]: v
+    for k, v in state_dict.items()
+    if k.startswith("obs_normalizer.")
+}
+missing, unexpected = obs_normalizer.load_state_dict(normalizer_state, strict=False)
+print("Missing keys:", missing)
+print("Unexpected keys:", unexpected)
+--- 11 markdown
+### 6. Define PlainCNN
+Exact shapes confirmed from the checkpoint's `state_dict` in Section 0's note above.
+Keeps only the policy path (encoder + action head) -- the critic is training-only and is
+not loaded.
+--- 12 code
+import torch.nn as nn
+
+
+class PlainCNN(nn.Module):
+    """Plain PyTorch rebuild of the trained conversion_friendly_v1 policy network.
+    Same weights, same architecture, no Sample Factory classes involved beyond this point
+    (the ObservationNormalizer above is applied separately, before this model sees the input).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
+        self.relu = nn.ReLU()
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(2304, 512)
+        self.action_head = nn.Linear(512, 4)
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+        x = self.flatten(x)
+        x = self.relu(self.fc(x))
+        return self.action_head(x)  # raw logits -- argmax for deterministic action
+
+
+model = PlainCNN()
+
+# Map Sample Factory's key names onto this model's layer names
+key_map = {
+    "encoder.basic_encoder.enc.conv_head.0.weight": "conv1.weight",
+    "encoder.basic_encoder.enc.conv_head.0.bias": "conv1.bias",
+    "encoder.basic_encoder.enc.conv_head.2.weight": "conv2.weight",
+    "encoder.basic_encoder.enc.conv_head.2.bias": "conv2.bias",
+    "encoder.basic_encoder.enc.conv_head.4.weight": "conv3.weight",
+    "encoder.basic_encoder.enc.conv_head.4.bias": "conv3.bias",
+    "encoder.basic_encoder.enc.mlp_layers.0.weight": "fc.weight",
+    "encoder.basic_encoder.enc.mlp_layers.0.bias": "fc.bias",
+    "action_parameterization.distribution_linear.weight": "action_head.weight",
+    "action_parameterization.distribution_linear.bias": "action_head.bias",
+}
+
+plain_state = {local_name: state_dict[sf_name] for sf_name, local_name in key_map.items()}
+missing, unexpected = model.load_state_dict(plain_state, strict=True)
+print("Missing:", missing)
+print("Unexpected:", unexpected)
+
+model.eval()
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+print("Model ready on", device)
+--- 13 markdown
+### 7. Sanity-check evaluation: PlainCNN vs. the known baseline (0.757 ± 0.121)
+Runs `doom_basic` episodes using PlainCNN directly (bypassing Sample Factory's model
+entirely), with the real `ObservationNormalizer` applied first. Deterministic (argmax)
+action selection, matching how the original 0.757 ± 0.121 result was produced.
+--- 14 code
+import numpy as np
+
+ACTION_REPEAT = 1   # first run with 1; if the score is clearly low, try 4
+
+
+def run_plaincnn_episodes(n_episodes=50, action_repeat=ACTION_REPEAT):
+    rewards = []
+    for ep in range(n_episodes):
+        obs, _ = env.reset()
+        done = truncated = False
+        total_reward = 0.0
+
+        while not (done or truncated):
+            raw = obs["obs"] if isinstance(obs, dict) else obs
+            obs_tensor = torch.as_tensor(raw).float().cpu().unsqueeze(0)  # add batch dim
+            obs_dict_for_norm = {"obs": obs_tensor.clone()}
+            obs_normalizer(obs_dict_for_norm)  # in-place: /255, then running mean/std
+
+            with torch.no_grad():
+                logits = model(obs_dict_for_norm["obs"].to(device))
+                action = torch.argmax(logits, dim=-1).item()
+
+            for _ in range(action_repeat):
+                obs, reward, done, truncated, _ = env.step(action)
+                total_reward += float(reward)
+                if done or truncated:
+                    break
+
+        rewards.append(total_reward)
+        if (ep + 1) % 10 == 0:
+            print(f"Episode {ep + 1}/{n_episodes}, running mean so far: {np.mean(rewards):.3f}")
+
+    return np.array(rewards)
+
+
+rewards = run_plaincnn_episodes(n_episodes=50)
+print(f"\nPlainCNN mean reward: {rewards.mean():.3f} ± {rewards.std():.3f}")
+print("Baseline (Sample Factory, same checkpoint): ~0.73 to 0.76")
+print(f"Episodes below 0: {(rewards < 0).sum()}")
+--- 15 markdown
+### 8. Interpreting the result
+
+- **Close to 0.757 ± 0.121** (within normal run-to-run noise): the extraction is
+  correct -- weights, architecture, and preprocessing all faithfully reproduced. Safe to
+  proceed directly to SNN conversion using this `PlainCNN` as the starting point.
+- **Noticeably worse** (e.g. near-random, or consistently much lower): something in the
+  extraction is off. Check, in order:
+  1. The `key_map` in Section 6 -- confirm each Sample Factory key is mapped to the
+     correct local layer (a transposed mapping between conv2/conv3 would still "load"
+     without error but produce wrong behavior).
+  2. The normalization in Section 5 -- confirm `Missing keys` / `Unexpected keys` printed
+     empty lists; non-empty means the running stats weren't actually loaded.
+  3. Whether `env`'s resolution/observation shape (printed in Section 4) actually matches
+     `(3, 72, 128)` -- if the environment was constructed with different `cfg` values
+     than training used, the input won't match what the weights expect.
+
+### Notes for the project going forward
+
+- This notebook deliberately does NOT touch SNNs yet -- it only verifies the extraction.
+- Once Section 7 confirms a match, the next notebook converts `PlainCNN`'s `ReLU` layers
+  to `snn.Leaky` neurons via snnTorch, using weight/threshold normalization (Diehl et
+  al.), with `conv1/conv2/conv3/fc`'s weights AND biases scaled consistently together.
+- The `ObservationNormalizer` step is preserved unchanged in the SNN pipeline too -- it
+  runs before rate-encoding, not inside any spiking layer.
+--- 16 markdown
+# SNN Conversion, Option 1: threshold balancing (hand-written)
+
+Pipeline: collect calibration frames -> measure per-layer activation scales (lambda)
+-> rescale weights -> swap ReLU for integrate-and-fire neurons -> test offline -> test in game.
+No retraining happens here. Reference to beat: PlainCNN 0.800 +/- 0.116 (ACTION_REPEAT = 1).
+--- 17 code
+import numpy as np, torch, torch.nn as nn, copy, json, os
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+for name in ['env', 'model', 'obs_normalizer', 'device']:
+    assert name in globals(), f'Missing {name}: run the PlainCNN notebook cells 1-6 first.'
+
+ACTION_REPEAT = 1                      # keep identical to the PlainCNN run, for every comparison
+SAVE_DIR = Path('conversion_friendly_v1')
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+torch.manual_seed(0); np.random.seed(0)
+print('ready, device:', device)
+print('Outputs will be saved to:', SAVE_DIR.resolve())
+--- 18 markdown
+Stores the normalised frames the policy actually sees. Skip the loop if the file already exists.
+--- 19 code
+FRAMES_PATH = f"{SAVE_DIR}/calib_frames_v2.pt"
+TARGET_FRAMES = 5000
+EPS_RANDOM = 0.3          # chance of a random action in the "noisy" episodes
+
+def prep(obs):
+    raw = obs["obs"] if isinstance(obs, dict) else obs
+    d = {"obs": torch.as_tensor(raw).float().cpu().unsqueeze(0)}
+    obs_normalizer(d)
+    return d["obs"]
+
+if os.path.exists(FRAMES_PATH):
+    saved = torch.load(FRAMES_PATH)
+    frames, ep_ids = saved["frames"], saved["ep_ids"]
+else:
+    frames, ep_ids, ep = [], [], 0
+    n_actions = env.action_space.n
+    while len(frames) < TARGET_FRAMES:
+        eps = 0.0 if ep % 2 == 0 else EPS_RANDOM      # alternate clean / noisy episodes
+        obs, _ = env.reset()
+        done = truncated = False
+        while not (done or truncated):
+            x = prep(obs)
+            frames.append(x.squeeze(0))
+            ep_ids.append(ep)
+            with torch.no_grad():
+                action = model(x.to(device)).argmax(1).item()
+            if np.random.rand() < eps:
+                action = np.random.randint(n_actions)
+            for _ in range(ACTION_REPEAT):
+                obs, r, done, truncated, _ = env.step(action)
+                if done or truncated:
+                    break
+        ep += 1
+    frames = torch.stack(frames)
+    ep_ids = torch.tensor(ep_ids)
+    torch.save({"frames": frames, "ep_ids": ep_ids}, FRAMES_PATH)
+
+print("frames:", tuple(frames.shape), "| episodes:", int(ep_ids.max()) + 1)
+--- 20 markdown
+Cell 4: calibration/test split and activation scales (lambda)
+--- 21 code
+cal_mask = (ep_ids % 10) < 7
+cal_frames, test_frames = frames[cal_mask], frames[~cal_mask]
+print("calibration:", len(cal_frames), "| test:", len(test_frames))
+
+@torch.no_grad()
+def layer_activations(m, x):
+    a1 = m.relu(m.conv1(x))
+    a2 = m.relu(m.conv2(a1))
+    a3 = m.relu(m.conv3(a2))
+    a4 = m.relu(m.fc(m.flatten(a3)))
+    return [a1, a2, a3, a4]
+
+@torch.no_grad()
+def get_lambdas(m, x_all, percentile=99.9, bs=128, per_batch=200_000):
+    samples = [[], [], [], []]
+    for i in range(0, len(x_all), bs):
+        acts = layer_activations(m, x_all[i:i+bs].to(device))
+        for k, a in enumerate(acts):
+            flat = a.flatten().cpu().numpy()
+            idx = np.random.choice(len(flat), min(per_batch, len(flat)), replace=False)
+            samples[k].append(flat[idx])
+    return [float(np.percentile(np.concatenate(s), percentile)) for s in samples]
+
+lambdas = get_lambdas(model, cal_frames, 99.9)
+print("lambdas:", [round(l, 4) for l in lambdas])
+assert all(l > 1e-6 for l in lambdas), "A layer is almost silent: try a higher percentile."
+--- 22 markdown
+Cell 5: the spiking network
+--- 23 code
+def if_step(v, current, threshold=1.0, v_init=0.5):
+    if v is None:
+        v = torch.full_like(current, v_init * threshold)   # half-threshold start cuts rounding error
+    v = v + current
+    spikes = (v >= threshold).float()
+    v = v - spikes * threshold                              # soft reset (subtract)
+    return v, spikes
+
+class SpikingPlainCNN(nn.Module):
+    def __init__(self, m, lambdas, v_init=0.5):
+        super().__init__()
+        l1, l2, l3, l4 = lambdas
+        self.v_init = v_init
+        self.conv1, self.conv2, self.conv3 = (copy.deepcopy(c) for c in (m.conv1, m.conv2, m.conv3))
+        self.fc, self.head = copy.deepcopy(m.fc), copy.deepcopy(m.action_head)
+        self.flatten = nn.Flatten()
+        with torch.no_grad():
+            self.conv1.weight /= l1;       self.conv1.bias /= l1
+            self.conv2.weight *= l1 / l2;  self.conv2.bias /= l2
+            self.conv3.weight *= l2 / l3;  self.conv3.bias /= l3
+            self.fc.weight    *= l3 / l4;  self.fc.bias    /= l4
+            self.head.weight  *= l4                         # undo scaling at the output
+
+    @torch.no_grad()
+    def forward(self, x, T):
+        v1 = v2 = v3 = v4 = None
+        out = 0
+        for _ in range(T):
+            v1, s1 = if_step(v1, self.conv1(x), v_init=self.v_init)   # analog input every step
+            v2, s2 = if_step(v2, self.conv2(s1), v_init=self.v_init)
+            v3, s3 = if_step(v3, self.conv3(s2), v_init=self.v_init)
+            v4, s4 = if_step(v4, self.fc(self.flatten(s3)), v_init=self.v_init)
+            out = out + self.head(s4)                       # output layer accumulates, never spikes
+        return out / T
+
+snn = SpikingPlainCNN(model, lambdas).to(device).eval()
+--- 24 markdown
+Cell 6: sanity check on the scaling
+
+If the scaling is right, an enormous T should reproduce the ANN almost exactly.
+--- 25 code
+x = test_frames[:64].to(device)
+with torch.no_grad():
+    ann_logits = model(x)
+    snn_logits = snn(x, T=512)
+print("max |logit difference| at T=512:", (ann_logits - snn_logits).abs().max().item())
+print("logit scale (mean |ANN logit|):", ann_logits.abs().mean().item())
+print("action match:", (ann_logits.argmax(1) == snn_logits.argmax(1)).float().mean().item())
+
+lam100 = get_lambdas(model, cal_frames, 100.0)
+snn100 = SpikingPlainCNN(model, lam100).to(device).eval()
+with torch.no_grad():
+    d = (model(x) - snn100(x, T=512)).abs().max().item()
+print("max |logit diff| at T=512 with percentile 100 (no clipping):", d)
+--- 26 markdown
+Cell 7: offline agreement versus T
+--- 27 code
+@torch.no_grad()
+def agreement(s, m, x_all, T, bs=128):
+    same = total = 0
+    for i in range(0, len(x_all), bs):
+        xb = x_all[i:i+bs].to(device)
+        same += (m(xb).argmax(1) == s(xb, T).argmax(1)).sum().item()
+        total += len(xb)
+    return same / total
+
+Ts = [4, 8, 16, 32, 64, 128, 256]
+agree = {T: agreement(snn, model, test_frames, T) for T in Ts}
+for T, a in agree.items():
+    print(f"T={T:4d}  agreement = {a:.3f}")
+
+plt.plot(list(agree), list(agree.values()), "o-"); plt.xscale("log", base=2)
+plt.xlabel("time steps T"); plt.ylabel("action agreement with ANN"); plt.ylim(0, 1.02)
+plt.grid(alpha=.3); plt.show()
+--- 28 markdown
+Cell 8: percentile sweep (the main tuning knob)
+--- 29 code
+sweep = {}
+for p in [99.0, 99.9, 99.99, 100.0]:
+    lam = get_lambdas(model, cal_frames, p)
+    s = SpikingPlainCNN(model, lam).to(device).eval()
+    sweep[p] = {T: agreement(s, model, test_frames, T) for T in [16, 32, 64, 128]}
+    print(f"percentile {p}:", {T: round(a, 3) for T, a in sweep[p].items()})
+--- 30 markdown
+Cell 9: in-game evaluation
+
+Run this only after the offline numbers look reasonable.
+--- 31 code
+def run_snn_episodes(s, T, n_episodes=50, action_repeat=ACTION_REPEAT):
+    rewards = []
+    for ep in range(n_episodes):
+        obs, _ = env.reset()
+        done = truncated = False
+        total = 0.0
+        while not (done or truncated):
+            action = s(prep(obs).to(device), T).argmax(1).item()
+            for _ in range(action_repeat):
+                obs, r, done, truncated, _ = env.step(action)
+                total += float(r)
+                if done or truncated:
+                    break
+        rewards.append(total)
+    return np.array(rewards)
+
+results = {}
+for T in [16, 32, 64]:
+    r = run_snn_episodes(snn, T)
+    results[T] = {"mean": float(r.mean()), "std": float(r.std()), "below0": int((r < 0).sum())}
+    print(f"T={T}: {r.mean():.3f} ± {r.std():.3f}, below 0: {(r < 0).sum()}   (ANN reference 0.800 ± 0.116)")
+--- 32 code
+BEST = 99.99
+lambdas = get_lambdas(model, cal_frames, BEST)
+print("lambdas:", [round(l, 4) for l in lambdas])
+snn = SpikingPlainCNN(model, lambdas).to(device).eval()
+
+def run_episodes(policy, n_episodes=300, action_repeat=ACTION_REPEAT):
+    rewards = []
+    for ep in range(n_episodes):
+        obs, _ = env.reset()
+        done = truncated = False
+        total = 0.0
+        while not (done or truncated):
+            with torch.no_grad():
+                action = policy(prep(obs).to(device)).argmax(1).item()
+            for _ in range(action_repeat):
+                obs, r, done, truncated, _ = env.step(action)
+                total += float(r)
+                if done or truncated:
+                    break
+        rewards.append(total)
+    return np.array(rewards)
+
+def summarize(name, r):
+    se = r.std() / np.sqrt(len(r))
+    print(f"{name:10s} {r.mean():.3f} ± {r.std():.3f} (SE {se:.3f}) | below 0: {(r<0).sum()} | below 0.3: {(r<0.3).sum()} | n={len(r)}")
+
+ann_r = run_episodes(model)
+summarize("ANN", ann_r)
+game = {}
+for T in [8, 16, 32, 48, 64]:
+    r = run_episodes(lambda x, T=T: snn(x, T))
+    game[T] = r
+    summarize(f"SNN T={T}", r)
+--- 33 code
+# --- save the converted SNN (rescaled weights + everything needed to rebuild it) ---
+torch.save({
+    "state_dict": snn.state_dict(),
+    "lambdas": lambdas,
+    "percentile": 99.99,
+    "v_init": snn.v_init,
+    "action_repeat": ACTION_REPEAT,
+}, f"{SAVE_DIR}/snn_converted_v2.pt")
+print("saved snn_converted_v2.pt")
+
+# --- run episodes on the SNN ---
+T_FINAL = 32          # headline T; 64 is the conservative choice
+N_EPISODES = 300
+
+snn_r = run_episodes(lambda x: snn(x, T_FINAL), n_episodes=N_EPISODES)
+summarize(f"SNN T={T_FINAL}", snn_r)
+
+# save the per-episode rewards so you can re-analyse later
+np.save(f"{SAVE_DIR}/snn_T{T_FINAL}_rewards.npy", snn_r)
+--- 34 code
+# Layer sizes for this network (from the shapes in your PlainCNN)
+n_neurons = [32*17*31, 64*7*14, 128*3*6, 512]           # conv1, conv2, conv3, fc outputs
+macs = {"conv1": 3_237_888, "conv2": 3_211_264, "conv3": 1_327_104, "fc": 1_179_648, "head": 2_048}
+ann_macs = sum(macs.values())                           # ~8.96M per decision
+
+@torch.no_grad()
+def spike_stats(s, x_all, T, bs=64):
+    totals = np.zeros(4); n = 0
+    for i in range(0, len(x_all), bs):
+        x = x_all[i:i+bs].to(device)
+        v = [None]*4
+        for _ in range(T):
+            v[0], s1 = if_step(v[0], s.conv1(x), v_init=s.v_init)
+            v[1], s2 = if_step(v[1], s.conv2(s1), v_init=s.v_init)
+            v[2], s3 = if_step(v[2], s.conv3(s2), v_init=s.v_init)
+            v[3], s4 = if_step(v[3], s.fc(s.flatten(s3)), v_init=s.v_init)
+            for k, sp in enumerate([s1, s2, s3, s4]):
+                totals[k] += sp.sum().item()
+        n += len(x)
+    return totals / n                                    # spikes per decision, per layer
+
+for T in [32, 64]:
+    spk = spike_stats(snn, test_frames[:500], T)
+    rate = spk / (np.array(n_neurons) * T)
+    # synaptic ops: each spike triggers (layer MACs / input neurons) accumulates in the next layer
+    sops = (spk[0] * macs["conv2"]/n_neurons[0] + spk[1] * macs["conv3"]/n_neurons[1]
+            + spk[2] * macs["fc"]/n_neurons[2]   + spk[3] * macs["head"]/n_neurons[3])
+    dense_first = T * macs["conv1"]                      # conv1 sees analog input every step
+    print(f"T={T}: spikes/decision per layer {spk.round(0)} | total {spk.sum():.0f}")
+    print(f"      firing rate/neuron/step {rate.round(3)}")
+    print(f"      SNN: {dense_first/1e6:.2f}M dense MACs (layer 1) + {sops/1e6:.2f}M accumulates"
+          f" | ANN: {ann_macs/1e6:.2f}M MACs")
+--- 35 markdown
+PlainCNN weights == original checkpoint weights
+
+This re-confirms Step 3's sanity check directly on the actual tensors, not just the resulting reward:
+--- 36 code
+import torch
+
+max_diff = 0.0
+for sf_name, local_name in key_map.items():
+    original = state_dict[sf_name].float()
+    rebuilt = dict(model.named_parameters())[local_name].detach().cpu()
+    diff = (original - rebuilt).abs().max().item()
+    max_diff = max(max_diff, diff)
+    status = "OK" if diff < 1e-6 else "MISMATCH"
+    print(f"{local_name:20s} max diff: {diff:.2e}  [{status}]")
+
+print(f"\nOverall max difference: {max_diff:.2e}")
+print("PASS" if max_diff < 1e-6 else "FAIL -- re-check key_map")
+--- 37 markdown
+SNN weights == PlainCNN weights, consistently rescaled
+
+Since I haven't seen the exact formula your earlier rescaling cell used, this check doesn't assume a specific formula — instead it verifies the property any correct rescaling method must have: every weight in a given layer should be multiplied by the same single factor, not an inconsistent mix:
+--- 38 code
+layers = ["conv1", "conv2", "conv3", "fc"]
+
+for layer_name in layers:
+    plain_w = dict(model.named_parameters())[f"{layer_name}.weight"].detach().cpu().flatten()
+    snn_w = dict(snn.named_parameters())[f"{layer_name}.weight"].detach().cpu().flatten()
+
+    # Elementwise ratio, ignoring near-zero weights (division noise)
+    mask = plain_w.abs() > 1e-6
+    ratios = (snn_w[mask] / plain_w[mask])
+
+    print(f"{layer_name:8s} scale factor: mean={ratios.mean():.4f}  std={ratios.std():.4f}  "
+          f"(std should be ~0 if scaling is a single clean per-layer factor)")
+--- 39 markdown
+Cell C: Saved file == in-memory SNN (round-trip integrity)
+--- 40 code
+import torch
+
+saved = torch.load(f"{SAVE_DIR}/snn_converted_v2.pt", map_location="cpu")
+saved_state = saved["state_dict"]
+
+max_diff = 0.0
+for name, param in snn.state_dict().items():
+    reloaded = saved_state[name].float().cpu()
+    original = param.float().cpu()
+    diff = (reloaded - original).abs().max().item()
+    max_diff = max(max_diff, diff)
+
+print(f"Max difference between saved file and in-memory SNN: {max_diff:.2e}")
+print("PASS" if max_diff < 1e-6 else "FAIL -- saved file does not match in-memory model")
+--- 41 markdown
+
+--- 42 code
+Cell D: Efficiency — spike counts and MACs
+
+This is the same measurement code from your earlier T=32/T=64 result — re-run it here against this latest converted model so the numbers in your report correspond to the actual checkpoint you're reporting on, not an earlier run:
+--- 43 code
+n_neurons = [32*17*31, 64*7*14, 128*3*6, 512]  # conv1, conv2, conv3, fc outputs
+macs = {"conv1": 3_237_888, "conv2": 3_211_264, "conv3": 1_327_104, "fc": 1_179_648, "head": 2_048}
+ann_macs = sum(macs.values())
+
+@torch.no_grad()
+def spike_stats(s, x_all, T, bs=64):
+    totals = np.zeros(4); n = 0
+    for i in range(0, len(x_all), bs):
+        x = x_all[i:i+bs].to(device)
+        v = [None]*4
+        for _ in range(T):
+            v[0], s1 = if_step(v[0], s.conv1(x), v_init=s.v_init)
+            v[1], s2 = if_step(v[1], s.conv2(s1), v_init=s.v_init)
+            v[2], s3 = if_step(v[2], s.conv3(s2), v_init=s.v_init)
+            v[3], s4 = if_step(v[3], s.fc(s.flatten(s3)), v_init=s.v_init)
+            for k, sp in enumerate([s1, s2, s3, s4]):
+                totals[k] += sp.sum().item()
+        n += len(x)
+    return totals / n
+
+for T in [32, 64]:
+    spk = spike_stats(snn, test_frames[:500], T)
+    rate = spk / (np.array(n_neurons) * T)
+    sops = (spk[0] * macs["conv2"]/n_neurons[0] + spk[1] * macs["conv3"]/n_neurons[1]
+            + spk[2] * macs["fc"]/n_neurons[2]   + spk[3] * macs["head"]/n_neurons[3])
+    dense_first = T * macs["conv1"]
+    print(f"T={T}: spikes/decision per layer {spk.round(0)} | total {spk.sum():.0f}")
+    print(f"      firing rate/neuron/step {rate.round(3)}")
+    print(f"      SNN: {dense_first/1e6:.2f}M dense MACs (layer 1) + {sops/1e6:.2f}M accumulates"
+          f" | ANN: {ann_macs/1e6:.2f}M MACs")
+===== doom_samplefactory_pipeline_v4.ipynb
+--- 0 markdown
+# DOOM Sample Factory Pipeline (v4)
+
+Changes from v3:
+- Fixed Section 7 (the encoder-inspection cell). `make_doom_env_impl` and `create_env`
+  both return a plain `Box` observation space, but `VizdoomEncoder` expects a `Dict`
+  with an `"obs"` key -- that dict-wrapping happens deeper inside Sample Factory's model
+  construction, not at the environment level. We now build the expected dict shape
+  manually before calling `make_vizdoom_encoder`.
+
+**Run this on Google Colab or Kaggle (Linux-backed) -- not native Windows.**
+Enable GPU first: Colab -> Runtime > Change runtime type > GPU.
+--- 1 markdown
+### 1. Install system dependencies
+--- 2 code
+!apt-get update -qq
+!apt-get install -y build-essential zlib1g-dev libsdl2-dev libjpeg-dev nasm tar \
+    libbz2-dev libgtk2.0-dev cmake git libfluidsynth-dev libgme-dev libopenal-dev \
+    timidity libwildmidi-dev unzip ffmpeg libboost-all-dev liblua5.1-dev xvfb
+--- 3 markdown
+### 2. Install Sample Factory and ViZDoom
+This can take several minutes.
+--- 4 code
+!pip install sample-factory
+!pip install vizdoom
+--- 5 markdown
+### 3. Force a CUDA-enabled PyTorch build, then GPU check
+Installing other packages above can silently swap Colab's preinstalled CUDA PyTorch for a
+CPU-only build. Force the CUDA build explicitly, then verify.
+--- 6 code
+!pip install torch --index-url https://download.pytorch.org/whl/cu124
+--- 7 markdown
+**Restart the runtime now** (Runtime > Restart session), then continue from the next cell
+below. A fresh pip-installed torch build sometimes needs a clean kernel to take effect.
+--- 8 code
+import torch
+
+print("torch version:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Device name:", torch.cuda.get_device_name(0))
+else:
+    print("No GPU visible -- fix the runtime/accelerator setting before continuing.")
+--- 9 markdown
+### 4. The PyTorch 2.6 checkpoint-loading fix
+Forces `torch.load` back to its pre-2.6 permissive default. Safe here because we only
+ever load checkpoints trained by us, in this same notebook.
+--- 10 code
+import torch
+
+if not getattr(torch.load, "_is_patched", False):
+    _original_torch_load = torch.load
+
+    def _patched_torch_load(*args, **kwargs):
+        kwargs["weights_only"] = False
+        return _original_torch_load(*args, **kwargs)
+
+    _patched_torch_load._is_patched = True
+    torch.load = _patched_torch_load
+
+print("torch.load patched (weights_only=False).")
+--- 11 markdown
+### 5. Register Sample Factory's ViZDoom environments and models
+--- 12 code
+import functools
+
+from sample_factory.algo.utils.context import global_model_factory
+from sample_factory.cfg.arguments import parse_full_cfg, parse_sf_args
+from sample_factory.envs.env_utils import register_env
+from sample_factory.envs.create_env import create_env
+from sample_factory.train import run_rl
+
+from sf_examples.vizdoom.doom.doom_model import make_vizdoom_encoder
+from sf_examples.vizdoom.doom.doom_params import add_doom_env_args, doom_override_defaults
+from sf_examples.vizdoom.doom.doom_utils import DOOM_ENVS, make_doom_env_from_spec
+
+
+def register_vizdoom_envs():
+    for env_spec in DOOM_ENVS:
+        make_env_func = functools.partial(make_doom_env_from_spec, env_spec)
+        register_env(env_spec.name, make_env_func)
+
+
+def register_vizdoom_models():
+    """Registers Sample Factory's default ViZDoom-tuned CNN encoder.
+
+    NOTE: default uses ELU and a GRU -- both overridden via config flags below
+    (--nonlinearity=relu, --use_rnn=False) rather than needing a fully custom encoder,
+    as long as BatchNorm is not also present (checked in Section 7).
+    """
+    global_model_factory().register_encoder_factory(make_vizdoom_encoder)
+
+
+def register_vizdoom_components():
+    register_vizdoom_envs()
+    register_vizdoom_models()
+
+
+def parse_vizdoom_cfg(argv=None, evaluation=False):
+    parser, _ = parse_sf_args(argv=argv, evaluation=evaluation)
+    add_doom_env_args(parser)
+    doom_override_defaults(parser)
+    final_cfg = parse_full_cfg(parser, argv)
+    return final_cfg
+
+
+register_vizdoom_components()
+--- 13 markdown
+### 6. Choose the scenario and training config
+
+`--nonlinearity=relu`: overrides the ELU default -- required for ANN-to-SNN conversion
+compatibility.
+
+`--use_rnn=False` + `--env_framestack=4`: use frame-stacking for temporal info instead of
+a GRU -- keeps the architecture a plain feedforward CNN, avoiding the much harder
+recurrent-SNN conversion problem.
+--- 14 code
+env = "doom_basic"
+train_for_env_steps = 2000000   # raised from 500000 to resume training
+num_workers = 8
+num_envs_per_worker = 4
+
+conversion_friendly_args = [
+    f"--env={env}",
+    "--experiment=conversion_friendly_v1",
+    f"--num_workers={num_workers}",
+    f"--num_envs_per_worker={num_envs_per_worker}",
+    f"--train_for_env_steps={train_for_env_steps}",
+    "--nonlinearity=relu",
+    "--use_rnn=False",
+]
+--- 15 markdown
+### 7. Inspect the encoder BEFORE training
+
+`create_env` returns a plain `Box` observation space, but `VizdoomEncoder` (the class
+wrapping the actual CNN) expects a `Dict` with an `"obs"` key -- that wrapping normally
+happens deeper inside Sample Factory's model-construction code, not at the environment
+level. We build the expected dict shape manually here so we can inspect the encoder in
+isolation.
+
+Check the printed output for any `BatchNorm` layer -- if one appears, it needs to be
+folded into the preceding conv layer after training (or replaced with a custom encoder)
+before this model can be converted to an SNN.
+--- 16 code
+inspect_cfg = parse_vizdoom_cfg(argv=conversion_friendly_args)
+inspect_env = create_env(env, cfg=inspect_cfg, env_config=None)
+
+# VizdoomEncoder expects obs_space["obs"] (and optionally obs_space["measurements"]),
+# but create_env returns a plain Box, not a Dict -- build the dict shape it expects.
+obs_space_for_encoder = {"obs": inspect_env.observation_space}
+
+inspect_encoder = make_vizdoom_encoder(inspect_cfg, obs_space_for_encoder)
+
+print(inspect_encoder)
+
+has_batchnorm = any("BatchNorm" in type(m).__name__ for m in inspect_encoder.modules())
+print("\nContains BatchNorm:", has_batchnorm)
+
+inspect_env.close()
+--- 17 markdown
+### 8. Train
+Only proceed once Section 7 confirms `Contains BatchNorm: False` -- otherwise, resolve
+that first (see the closing notes).
+--- 18 code
+cfg = parse_vizdoom_cfg(argv=conversion_friendly_args)
+status = run_rl(cfg)
+--- 19 markdown
+### 9. Confirm training actually used the GPU and the correct overrides
+--- 20 code
+import json
+
+with open("train_dir/conversion_friendly_v1/config.json") as f:
+    saved_cfg = json.load(f)
+
+print("Device used for training:", saved_cfg.get("device"))
+print("Nonlinearity used:", saved_cfg.get("nonlinearity"))
+print("RNN used:", saved_cfg.get("use_rnn"))
+--- 21 markdown
+### 10. Evaluate (50 episodes)
+--- 22 code
+import re, logging, numpy as np
+from sample_factory.enjoy import enjoy
+
+class Grab(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.avgs = []
+    def emit(self, record):
+        m = re.search(r"Avg episode reward: ([-\d.]+),", record.getMessage())
+        if m:
+            self.avgs.append(float(m.group(1)))
+
+grab = Grab()
+logging.getLogger("rl").addHandler(grab)   # assumes SF logs under "rl"
+
+eval_cfg = parse_vizdoom_cfg(
+    argv=[
+        f"--env={env}",
+        "--experiment=conversion_friendly_v1",
+        "--num_workers=1",
+        "--no_render",
+        "--max_num_episodes=50",
+        "--eval_deterministic=True",
+        "--save_video",
+    ],
+    evaluation=True,
+)
+enjoy(eval_cfg)
+
+a = np.array(grab.avgs)
+n = np.arange(1, len(a) + 1)
+eps = n * a - (n - 1) * np.concatenate([[0], a[:-1]])
+print("episodes:", len(eps))
+print(f"mean {eps.mean():.3f} ± {eps.std():.3f}")
+print("episodes below 0:", (eps < 0).sum())
+print("worst 5:", np.sort(eps)[:5].round(2))
+--- 23 markdown
+### 11. Watch the replay
+--- 24 code
+from base64 import b64encode
+from IPython.display import HTML
+
+mp4 = open("train_dir/conversion_friendly_v1/replay.mp4", "rb").read()
+data_url = "data:video/mp4;base64," + b64encode(mp4).decode()
+HTML(
+    """
+<video width=640 controls>
+      <source src="%s" type="video/mp4">
+</video>
+"""
+    % data_url
+)
+--- 25 markdown
+### 12. Record your results here
+--- 26 markdown
+- Scenario: `doom_basic`
+- Total training steps: 2,000,000
+- nonlinearity: relu | use_rnn: False | single frame (no frame stacking).
+- Contains BatchNorm: False
+- Device used: GPU
+- Evaluation episodes: 50
+- Mean reward ± std: (fill in from `enjoy()`'s printed output)
+- Checkpoint path: `train_dir/conversion_friendly_v1/checkpoint_p0/...`
+- Date run: (fill in)
+--- 27 markdown
+### Notes for the project going forward
+
+- **Official Phase 1 ANN baseline pipeline**, replacing both the earlier SB3 notebook
+  (unresolved evaluation discrepancy) and the v1/v2 Sample Factory notebooks (used
+  default ELU + GRU, not conversion-friendly).
+- **If Section 7 shows BatchNorm present**: either (a) fold BatchNorm into the preceding
+  conv layer's weights after training (`torch.nn.utils.fuse_conv_bn_eval` can help), or
+  (b) write and register a fully custom encoder matching `ConversionFriendlyCNN`'s
+  constraints, via `global_model_factory().register_encoder_factory(...)`.
+- **Reproducibility**: save the final checkpoint + `config.json` to Google Drive or
+  download locally -- Colab/Kaggle sessions are ephemeral.
+--- 28 code
+import shutil
+from google.colab import files
+
+shutil.make_archive("conversion_friendly_v1_backup", "zip", "train_dir/conversion_friendly_v1")
+files.download("conversion_friendly_v1_backup.zip")
+--- 29 code
+from google.colab import drive
+drive.mount('/content/drive')
+
+import shutil
+shutil.copytree(
+    "train_dir/conversion_friendly_v1",
+    "/content/drive/MyDrive/doom-snn-project/conversion_friendly_v1",
+    dirs_exist_ok=True
+)
+--- 30 code
+!pip download sample-factory --no-deps --no-binary :all: -d /tmp/sf -q
+!cd /tmp/sf && tar xzf sample_factory-*.tar.gz && grep -rniE "pool" sample_factory-*/sample_factory/model sample_factory-*/sf_examples/vizdoom --include=*.py
