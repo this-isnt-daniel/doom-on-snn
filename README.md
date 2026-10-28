@@ -1,5 +1,9 @@
 # doom-on-snn
 
+University Linux GPU server copies are in [GPU folders](<GPU folders/README.md>),
+with local persistent paths and no Colab/Drive setup. See that guide before running
+them on the cluster. The original notebooks below retain their Colab setup.
+
 Spiking neural network (SNN) policies for the ViZDoom `doom_basic` scenario. The project compares two ways of
 getting a spiking policy:
 
