@@ -1,5 +1,87 @@
 # Defend the center experiments
 
+## Controlled LIF sweeps
+
+[defend_the_center_lif_sweeps.ipynb](defend_the_center_lif_sweeps.ipynb) screens
+learning rates (3e-5/1e-4/3e-4), frame skip (4/2), stacked observations (1/2/4),
+ammo input (off/on), and ammunition penalties (0/.01/.03/.1 per ammo unit).
+It changes one factor at a time and shares the baseline: ten configurations rather
+than a Cartesian grid. Upload `sweep_support.py` and `sweep_worker.py` alongside it.
+Existing notebooks and checkpoints are not altered.
+
+Default mode only prints a plan: `ENABLE_TRAINING=False`. Start with smoke mode,
+then explicitly enable training. For full screening, set `SMOKE_TEST=False` and
+retain seed 0; full milestones are 2M, 4M, 8M with 300 evaluation episodes each.
+Ten full runs request 80M Sample Factory steps; seeds 0/1/2 request 240M. Reduce
+`CATEGORIES` to control cost and confirm finalists separately across seeds.
+These are fresh experiments, not fine-tuning existing checkpoints. GPU workers
+launch sequentially; the notebook controller does not initialize CUDA.
+
+Artifacts go to `outputs/sweeps/<SWEEP_TAG>`; each candidate has calibration,
+training logs/config/checkpoints, milestone JSON/episode CSVs, and completion state.
+The notebook prints/saves the scorecard, draws learning/efficiency/survival/compute
+charts and firing-rate heatmaps, and writes `best_by_category.json` only for fully
+evaluated categories. Rankings use mean original return across all planned seeds
+at the final target, not whichever checkpoint happens to score highest. Smoke or
+single-seed winners are preliminary. Original evaluation reward is checked explicitly
+even for penalty-trained policies. Completed jobs require identical settings for
+reuse; failed/incomplete training needs inspection and a new tag for a clean restart.
+
+Stacking concatenates past RGB images along channels and changes the first layer's
+input count. The wrapper scales pixels to [0,1] and Sample Factory uses obs_scale=1,
+so the extra ammo scalar is not accidentally divided by an image scale. Running
+normalization selects only images. Ammo is clipped ammo/26 and appended to encoder
+features. This additional information
+requires a matched ANN experiment before claiming a spiking-method advantage.
+The ammo divisor 26 follows this scenario's observed starting supply; revise if the
+scenario assets change. Penalties are custom training objectives, not the benchmark's
+original reward. Frame skip changes control frequency and may change the relationship
+between training counters, simulated time and observations. Report actual saved step
+counts, game seconds, decisions and training wall time rather than assuming equal cost.
+
+Inference timings include normalized batch-1 input transfer, policy forward and
+action decoding after warmup, synchronized on CUDA; they exclude simulation and
+the extra activity pass. Training time excludes calibration/evaluation. Firing rates
+divide observed spikes by neuron-time slots, and complement zero-event sparsity.
+Latest-at-milestone checkpoint identities/hashes are saved; later training may prune
+older regular checkpoints, so metrics remain available but not every intermediate
+weight file is guaranteed to remain. Charts show validation returns, not shaped
+training reward. Use new evaluation seeds for final held-out reporting after tuning.
+
+Local checks cover wrapper history, ammo scaling, penalty/original reward separation,
+all stack/ammo encoder combinations using real PyTorch forward/backward, plan
+deduplication and syntax. Sample Factory/ViZDoom/GPU integration must pass the smoke
+run on the server; those packages are not installed in the local test environment.
+
+## Three-seed audit
+
+[defend_the_center_three_seed_audit.ipynb](defend_the_center_three_seed_audit.ipynb)
+compares the existing LIF seed-0/1/2 runs, latest and best-training-reward checkpoints
+separately. It defaults to **no training**, 300 matched evaluation episodes per
+checkpoint, and three replay videos per checkpoint (18 videos total). Each video
+has a matching decision/action/health/ammo CSV. Episode reports include kills,
+ammo use, kills per round and survival decisions. The combined table also reports
+variation across training-run means, separately from within-run episode variation.
+
+Check `EXPERIMENTS` before running, especially if a run used a different tag.
+Set `DEFEND_OUTPUT_ROOT` before Jupyter if the runs live elsewhere. Audits write
+under `outputs/seed_audits/<AUDIT_TAG>`. Completed jobs are reused only when submitted
+settings match; choose a new audit tag after checkpoints change. An incomplete job
+requires `RETRY_INCOMPLETE=True` to overwrite its partial audit, not its training
+checkpoint. Missing best snapshots or ffmpeg cause explicit errors rather than
+silently selecting another model. Stop training before auditing its checkpoints.
+
+Optional `TRAINING_ACTION="fresh"` or `"resume"` launches seeds sequentially in
+fresh Python subprocesses. Fresh requires unused experiment names and recalibrates;
+resume keeps saved calibration settings. The requested total-step target is applied
+explicitly in the worker. Inspect all other resolved training settings on resume.
+Defaults for fresh training are beta=0.9, T=8 and an 8M target. This is not required
+to investigate the existing results. Interruption terminates the direct subprocess;
+inspect server processes for surviving Sample Factory children before restarting.
+
+Syntax and simulated episode logging are checked locally. Actual multi-process GPU
+training, ViZDoom variable access and ffmpeg encoding require server verification.
+
 Two independent Sample Factory pipelines for the standard
 `doom_defend_the_center` scenario:
 
