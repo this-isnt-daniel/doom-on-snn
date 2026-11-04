@@ -1,5 +1,11 @@
 # My way home: ANN and snnTorch navigation policies
 
+For the separate random Explore-Go-inspired ANN experiment, see
+[EXPLORE_GO.md](EXPLORE_GO.md) and
+[my_way_home_ann_explore_go.ipynb](my_way_home_ann_explore_go.ipynb).
+It includes three matched comparison arms and requires native smoke validation
+before full training.
+
 Two independent notebooks:
 
 - [my_way_home_ann.ipynb](my_way_home_ann.ipynb): Sample Factory PPO with a conventional
