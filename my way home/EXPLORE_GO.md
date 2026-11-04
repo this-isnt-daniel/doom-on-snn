@@ -83,22 +83,43 @@ The ledger also counts in-flight samples that never make it into an update.
 
 ## Storage and resuming
 
-The SQLite WAL ledger requires a filesystem with reliable local locking. If your
-home directory is network mounted, select allocated node-local scratch as
-`OUTPUT_ROOT` **before** running. Back up the closed output directory after jobs;
-retain checkpoints/config, results and the ledger together. Do not copy an open
-database file alone. Per-action durable logging adds runtime overhead.
+Workers update counters in shared RAM under a short lock. They perform no
+per-action database writes or manager-server requests. The parent atomically
+replaces `ledgers/<experiment>.json` approximately every 30 seconds and flushes it
+at orderly shutdown. NFS can now hold these infrequent snapshots without SQLite
+WAL locking. Checkpoint/log I/O and shared GPU load can still affect throughput.
+Set `COUNTER_SAVE_SECONDS` in the notebook to change the save interval.
+
+Forced termination, node failure or power loss can lose counts since the last
+successful snapshot. Live budget checks still use the exact shared RAM counts;
+on crash/resume the total can therefore undercount unsaved work. Retain snapshots
+alongside model checkpoints, and do not claim crash-exact interaction accounting.
+Only aggregate outcome counts are saved; per-reset database event rows are no
+longer recorded. `training_metrics.jsonl` and evaluation outputs remain available.
 
 Fresh mode refuses existing checkpoints/ledgers. To continue an interrupted run,
 inspect its log, retain its name/settings, set `RUN_MODE="resume"`, and run just
 that job (for example `run_job(JOBS[0], "train")`, after rerunning settings).
 Increase the cumulative budget to extend a completed run. For a new independent
 experiment use a new `RUN_TAG`. Resume retains counters and per-environment reset
-ordinals, not an exact snapshot of all asynchronous simulator/RNG states. A hard
-node crash between a simulator action and its ledger commit cannot be atomic.
+ordinals from the last saved snapshot, not an exact snapshot of all asynchronous
+simulator/RNG states.
+
+For an old SQLite run, stop all its training processes **before** pulling/restarting.
+Resume automatically imports its counters and reset ordinals once, read-only,
+into the new JSON format. The old `.sqlite` and any sidecars are retained; do not
+delete them before migration. New JSON is preferred on later resumes, preventing
+double-counting. An unreadable/corrupt old database fails visibly.
+
+This source change invalidates older smoke certificates. Updated smoke jobs use
+the separate `_ram_smoke` suffix and have their own `SMOKE_RUN_MODE`, so the old
+full experiment name can be retained. Run fresh RAM smoke tests first. Then set
+`RUN_MODE="resume"` for the existing full run and launch only that job, e.g.
+`run_job(JOBS[0], "train")`. Do not resume the entire sweep if other jobs have not
+been created; those jobs still need fresh mode.
 
 Outputs under `outputs/explore_go` include per-run checkpoints, controller logs,
-SQLite counts/outcomes, `training_metrics.jsonl` (entropy/value loss/Go returns),
+JSON counter/outcome snapshots, `training_metrics.jsonl` (entropy/value loss/Go returns),
 session timings, ordinary-reset episode CSVs and summaries, comparison CSVs and
 charts. Final rankings require all planned seeds and use ordinary-reset success,
 then original return; they do not select the luckiest training seed. Training Go

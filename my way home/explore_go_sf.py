@@ -1,6 +1,6 @@
 """Sample Factory integration; model and PPO/GAE are reused unchanged."""
 import functools
-from explore_go_core import ExploreGo, ExploreSettings, Ledger
+from explore_go_core import ExploreGo, ExploreSettings
 import home_env
 
 
@@ -9,19 +9,20 @@ def settings(cfg):
                            cfg.eg_probability, cfg.eg_fraction, cfg.eg_reset_attempts)
 
 
-def make_env(spec, name, cfg, env_config, render_mode=None, **kwargs):
+def make_env(spec, name, cfg, env_config, render_mode=None, ledger=None, **kwargs):
     env = home_env.make_home(spec, name, cfg, env_config, render_mode, **kwargs)
     # Environment-info probes and all evaluation/replay use ordinary resets.
     if not cfg.eg_training or env_config is None: return env
     slot = "_".join(f"{k}{env_config.get(k, 0)}" for k in ["worker_index", "vector_index", "env_id"])
-    return ExploreGo(env, settings(cfg), cfg.seed, slot, cfg.env_frameskip, Ledger(cfg.eg_ledger))
+    if ledger is None: raise RuntimeError("Training requires the parent's shared counter ledger")
+    return ExploreGo(env, settings(cfg), cfg.seed, slot, cfg.env_frameskip, ledger)
 
 
-def register():
+def register(ledger=None):
     from sample_factory.envs.env_utils import register_env
     from sf_examples.vizdoom.doom.doom_utils import DOOM_ENVS
     spec = next(s for s in DOOM_ENVS if s.name == "doom_my_way_home")
-    register_env(spec.name, functools.partial(make_env, spec))
+    register_env(spec.name, functools.partial(make_env, spec, ledger=ledger))
 
 
 def add_args(parser):
@@ -52,6 +53,8 @@ def attach_budget_monitor(runner, ledger, budget, unit, destination):
     last_print = [0.]
 
     def should_stop():
+        if ledger._flush_error is not None:
+            raise RuntimeError("Periodic counter snapshot failed; inspect storage") from ledger._flush_error
         counts = ledger.snapshot()
         if time.monotonic()-last_print[0] > 15:
             print("EXPLORE_GO_COUNTS", json.dumps(counts), flush=True)

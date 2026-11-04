@@ -10,10 +10,20 @@ from typing import Optional
 import unittest
 from unittest.mock import patch
 import sys
+import multiprocessing as mp
+import sqlite3
+import time
+import json
 import gymnasium as gym
 import numpy as np
 import torch
 from explore_go_core import ExploreGo, ExploreSettings, Ledger, native_tics
+
+
+def update_shared_ledger(ledger, slot, iterations):
+    for _ in range(iterations): ledger.add(go_decisions=1, go_game_tics=4)
+    ledger.next_reset(slot)
+    ledger.close()  # Child close must not persist or stop the parent's saver.
 
 
 def source_definitions(path, names, namespace):
@@ -164,7 +174,7 @@ class MechanismTests(unittest.TestCase):
 
     def test_durable_accounting_and_resume_reset_ordinals(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp)/"counts.sqlite"
+            path = Path(tmp)/"counts.json"
             first = Ledger(path)
             self.assertEqual(first.next_reset("w0"),0)
             first.add(explore_decisions=3, explore_game_tics=12, go_decisions=2, go_game_tics=8)
@@ -174,6 +184,84 @@ class MechanismTests(unittest.TestCase):
             self.assertEqual(second.snapshot()["total_game_tics"],20)
             self.assertEqual(second.snapshot()["total_decisions"],5)
             second.close()
+
+    def test_spawned_workers_share_exact_counters_without_disk_writes(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)/"counts.json"
+            ledger = Ledger(path, slots=["a","b"])
+            ctx = mp.get_context("spawn")
+            processes = [ctx.Process(target=update_shared_ledger,args=(ledger,slot,1000)) for slot in ["a","b"]]
+            for process in processes: process.start()
+            for process in processes:
+                process.join(timeout=45)
+                if process.is_alive(): process.terminate(); process.join(); self.fail("Shared-counter child hung")
+                self.assertEqual(process.exitcode,0)
+            self.assertEqual(ledger.snapshot()["total_decisions"],2000)
+            self.assertEqual(ledger.snapshot()["total_game_tics"],8000)
+            self.assertFalse(path.exists(),"Worker actions or closes wrote to disk")
+            ledger.close()
+            restored = Ledger(path,slots=["a","b"])
+            self.assertEqual(restored.snapshot()["total_decisions"],2000)
+            self.assertEqual(restored.next_reset("a"),1)
+            restored.close()
+
+    def test_periodic_save_atomic_replacement_and_final_flush(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)/"counts.json"
+            ledger = Ledger(path,save_interval=.02)
+            ledger.start_saving()
+            ledger.add(go_decisions=3,go_game_tics=12)
+            deadline = time.monotonic()+5
+            while time.monotonic() < deadline:
+                state = json.loads(path.read_text())
+                if state["counts"]["go_decisions"] == 3: break
+                time.sleep(.01)
+            else: self.fail("Periodic save did not run")
+            ledger.add(explore_decisions=2,explore_game_tics=8)
+            ledger.close()
+            restored = Ledger(path)
+            self.assertEqual(restored.snapshot()["total_decisions"],5)
+            self.assertEqual(restored.snapshot()["total_game_tics"],20)
+            self.assertFalse(list(Path(tmp).glob("*.tmp")))
+            restored.close()
+
+    def test_active_parent_saver_can_be_passed_to_spawned_worker(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)/"counts.json"
+            ledger = Ledger(path, save_interval=3600)
+            ledger.start_saving()
+            before = path.read_bytes()
+            try:
+                process = mp.get_context("spawn").Process(target=update_shared_ledger,args=(ledger,"w0",10))
+                process.start(); process.join(timeout=45)
+                if process.is_alive(): process.terminate(); process.join(); self.fail("Spawn with active saver hung")
+                self.assertEqual(process.exitcode,0)
+                self.assertEqual(ledger.snapshot()["total_decisions"],10)
+                self.assertTrue(ledger._thread.is_alive())
+                self.assertEqual(path.read_bytes(),before)
+            finally: ledger.close()
+
+    def test_read_only_legacy_migration_preserves_counts_and_reset_ordinals(self):
+        with TemporaryDirectory() as tmp:
+            legacy = Path(tmp)/"counts.sqlite"
+            with sqlite3.connect(legacy) as db:
+                db.execute("CREATE TABLE counts (key TEXT PRIMARY KEY,value REAL)")
+                db.execute("CREATE TABLE resets (slot TEXT PRIMARY KEY,ordinal INTEGER)")
+                db.executemany("INSERT INTO counts VALUES (?,?)",[("go_decisions",7),("go_game_tics",28)])
+                db.execute("INSERT INTO resets VALUES ('w0',9)")
+            db.close()
+            original = legacy.read_bytes()
+            path = legacy.with_suffix(".json")
+            ledger = Ledger(path)
+            self.assertEqual(ledger.snapshot()["total_decisions"],7)
+            self.assertEqual(ledger.next_reset("w0"),10)
+            ledger.add(explore_decisions=1)
+            ledger.close()
+            self.assertEqual(legacy.read_bytes(),original)
+            # Prefer new JSON on subsequent resumes; don't reimport or double-count.
+            restored = Ledger(path)
+            self.assertEqual(restored.snapshot()["total_decisions"],8)
+            restored.close()
 
     def test_native_terminal_clock_reset_and_reward_validation(self):
         self.assertEqual(native_tics(100,0,.9997,-.0001,4),3)

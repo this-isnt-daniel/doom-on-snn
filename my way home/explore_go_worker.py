@@ -46,13 +46,15 @@ def run(job):
     run_dir = root/"train_dir"/name
     out = root/"results"/name
     out.mkdir(parents=True, exist_ok=True)
-    ledger_path = root/"ledgers"/f"{name}.sqlite"
+    ledger_path = root/"ledgers"/f"{name}.json"
+    legacy_ledger_path = ledger_path.with_suffix(".sqlite")
     training = job["stage"] == "train"
-    if training and job["mode"] == "fresh" and (run_dir.exists() or ledger_path.exists()):
+    if training and job["mode"] == "fresh" and (run_dir.exists() or ledger_path.exists() or legacy_ledger_path.exists()):
         raise FileExistsError("Fresh run refuses an existing model or ledger; select a new experiment tag")
     if not training or job["mode"] == "resume":
         if not (run_dir/"config.json").is_file(): raise FileNotFoundError(run_dir/"config.json")
-        if training and not ledger_path.exists(): raise FileNotFoundError("Cannot resume without interaction ledger")
+        if training and not (ledger_path.exists() or legacy_ledger_path.exists()):
+            raise FileNotFoundError("Cannot resume without counter snapshot or legacy ledger")
     architecture = dict(seed=seed, stack=job["stack"], frame_skip=job["frame_skip"],
                         learning_rate=job["learning_rate"], batch_size=job["batch_size"],
                         workers=job["workers"], envs_per_worker=job["envs_per_worker"],
@@ -103,7 +105,10 @@ def run(job):
         cfg.eg_ledger = str(ledger_path)
         # Disable the Go-only stopping budget; monitor the ledger's total instead.
         cfg.train_for_env_steps = 10**15
-        ledger = Ledger(ledger_path)
+        slots = [f"worker_index{w}_vector_index{v}_env_id{w*job['envs_per_worker']+v}"
+                 for w in range(job["workers"]) for v in range(job["envs_per_worker"])]
+        ledger = Ledger(ledger_path, slots, job.get("counter_save_seconds",30.))
+        integration.register(ledger)
         before = ledger.snapshot()
         if before[f"total_{job['budget_unit']}"] >= job["budget"]:
             ledger.close(); raise RuntimeError("Total budget already spent; evaluate or increase the explicit total target")
@@ -114,10 +119,13 @@ def run(job):
         runner.cfg.eg_ledger = str(ledger_path)
         runner.cfg.train_for_env_steps = 10**15
         integration.attach_budget_monitor(runner, ledger, job["budget"], job["budget_unit"], out)
-        status = runner.init()
-        if status == 0: status = runner.run()
+        try:
+            ledger.start_saving()
+            status = runner.init()
+            if status == 0: status = runner.run()
+        finally:
+            ledger.close()
         after = ledger.snapshot()
-        ledger.close()
         summary = dict(requested_budget=job["budget"], budget_unit=job["budget_unit"],
                        actual=after, before=before, seconds=time.perf_counter()-started,
                        status=int(status), overshoot=after[f"total_{job['budget_unit']}"]-job["budget"],

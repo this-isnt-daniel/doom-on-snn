@@ -1,8 +1,13 @@
 """Training-only random-prefix exploration, independent of PPO implementation."""
 from dataclasses import dataclass
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
+import multiprocessing as mp
+import os
+import threading
+import time
 import gymnasium as gym
 import numpy as np
 
@@ -34,45 +39,113 @@ class RandomExplorer:
 
 
 class Ledger:
-    """Durable, transaction-safe counts shared across sampling processes.
+    """Shared RAM counters; only the parent periodically saves atomic JSON snapshots.
 
-    Counts are committed after each real env.step. Restart retains all observed
-    interactions, even if they weren't learned from before interruption. A hard
-    process/node crash between a simulator action and its commit cannot be atomic.
+    Pass this object through SF's spawned environment factory, never through its
+    JSON configuration. Per-action updates take a shared-memory lock, without IPC
+    servers or filesystem writes. Forced exits can lose counts since the last save.
     """
-    def __init__(self, path):
+    KEYS = (
+        "explore_decisions", "explore_game_tics", "explore_reward",
+        "go_decisions", "go_game_tics", "go_reward", "native_resets",
+        "explore_selected", "ordinary_starts", "exploration_requested_steps",
+        "exploration_capped", "explore_goal", "explore_timeout", "explore_other_terminal",
+        "exploration_aborted_episodes", "valid_go_starts", "explored_go_starts",
+        "reset_retry_exhausted", "go_episodes", "go_goals", "go_timeouts",
+        "go_completed_return", "go_completed_decisions",
+    )
+
+    def __init__(self, path, slots=None, save_interval=30.):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(self.path), timeout=60)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.execute("CREATE TABLE IF NOT EXISTS counts (key TEXT PRIMARY KEY,value REAL NOT NULL)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS resets (slot TEXT PRIMARY KEY,ordinal INTEGER NOT NULL)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY,slot TEXT,kind TEXT,details TEXT)")
-        self.db.commit()
+        self.slots = tuple(slots if slots is not None else ["w0"])
+        if not self.slots or len(set(self.slots)) != len(self.slots): raise ValueError("Invalid ledger slots")
+        if save_interval <= 0: raise ValueError("save_interval must be positive")
+        self.save_interval = float(save_interval)
+        self.owner_pid = os.getpid()
+        self._thread = self._stop = None
+        self._flush_error = None
+        ctx = mp.get_context("spawn")
+        self.lock = ctx.RLock()
+        self.counts = ctx.Array("d", len(self.KEYS), lock=self.lock)
+        self.resets = ctx.Array("q", [-1]*len(self.slots), lock=self.lock)
+        self._index = {key:i for i,key in enumerate(self.KEYS)}
+        self._slot_index = {slot:i for i,slot in enumerate(self.slots)}
+        state = None
+        if self.path.exists():
+            state = json.loads(self.path.read_text())
+            if state.get("format_version") != 1: raise ValueError("Unsupported counter snapshot")
+        else:
+            # One-time read-only import. Old jobs MUST be stopped before resuming.
+            legacy = self.path.with_suffix(".sqlite")
+            if legacy.exists():
+                with closing(sqlite3.connect(legacy.resolve().as_uri()+"?mode=ro", uri=True)) as db:
+                    state = dict(counts=dict(db.execute("SELECT key,value FROM counts")),
+                                 resets=dict(db.execute("SELECT slot,ordinal FROM resets")))
+                print(f"Imported stopped-run SQLite counters: {legacy}; original retained", flush=True)
+        if state:
+            unknown = set(state["resets"])-set(self.slots)
+            if unknown: raise ValueError(f"Saved environment slots differ: {unknown}")
+            for key, value in state["counts"].items(): self.counts[self._index[key]] = value
+            for slot, ordinal in state["resets"].items(): self.resets[self._slot_index[slot]] = ordinal
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_thread"] = state["_stop"] = None
+        return state
 
     def add(self, **increments):
-        with self.db:
+        with self.lock:
             for key, value in increments.items():
-                self.db.execute("INSERT INTO counts VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=value+excluded.value",
-                                (key, float(value)))
+                self.counts[self._index[key]] += float(value)
 
     def next_reset(self, slot):
-        with self.db:
-            self.db.execute("INSERT INTO resets VALUES (?,0) ON CONFLICT(slot) DO UPDATE SET ordinal=ordinal+1", (slot,))
-            return int(self.db.execute("SELECT ordinal FROM resets WHERE slot=?", (slot,)).fetchone()[0])
+        with self.lock:
+            index = self._slot_index[slot]
+            self.resets[index] += 1
+            return int(self.resets[index])
 
     def event(self, slot, kind, **details):
-        with self.db:
-            self.db.execute("INSERT INTO events(slot,kind,details) VALUES (?,?,?)", (slot, kind, json.dumps(details)))
+        # Aggregate outcome counts are already updated by ExploreGo. Intentionally
+        # omit per-reset event files to keep worker interaction paths disk-free.
+        pass
 
     def snapshot(self):
-        result = dict(self.db.execute("SELECT key,value FROM counts"))
+        with self.lock: result = dict(zip(self.KEYS, self.counts[:]))
         for unit in ["decisions", "game_tics"]:
             result[f"total_{unit}"] = result.get(f"explore_{unit}", 0) + result.get(f"go_{unit}", 0)
         return result
 
-    def close(self): self.db.close()
+    def flush(self):
+        if os.getpid() != self.owner_pid: return
+        # Release the simulator lock BEFORE any serialization or filesystem IO.
+        with self.lock:
+            state = dict(format_version=1, saved_at=time.time(),
+                         counts=dict(zip(self.KEYS,self.counts[:])),
+                         resets=dict(zip(self.slots,self.resets[:])))
+        temporary = self.path.with_name(self.path.name+f".{self.owner_pid}.tmp")
+        with temporary.open("w") as f:
+            json.dump(state,f,indent=2); f.flush(); os.fsync(f.fileno())
+        os.replace(temporary,self.path)
+
+    def start_saving(self):
+        if os.getpid() != self.owner_pid or self._thread is not None: return
+        self.flush()
+        self._stop = threading.Event()
+        def save_loop():
+            while not self._stop.wait(self.save_interval):
+                try: self.flush()
+                except Exception as exc:
+                    self._flush_error = exc
+                    print(f"Counter snapshot failed: {exc}", flush=True)
+        self._thread = threading.Thread(target=save_loop,daemon=True,name="counter-snapshots")
+        self._thread.start()
+
+    def close(self):
+        if os.getpid() != self.owner_pid: return
+        if self._thread is not None:
+            self._stop.set(); self._thread.join(); self._thread = None
+        self.flush()
 
 
 def native_tics(before, after, reward, living_reward, frame_skip):
@@ -211,6 +284,5 @@ class ExploreGo(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
     def close(self):
-        try: self.env.close()
-        finally:
-            if self.ledger: self.ledger.close()
+        # Shared counter lifetime belongs to the parent, not individual envs.
+        self.env.close()
